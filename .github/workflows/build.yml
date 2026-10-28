@@ -1,0 +1,24 @@
+# Manual trigger only, on purpose: start a run with scripts/cloud-build.sh. No push or schedule triggers.
+name: build
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app (signed later on John's Mac by scripts/install.sh)
+        run: |
+          set -euo pipefail
+          APP="build/Audrey Talk.app"
+          mkdir -p "$APP/Contents/MacOS"
+          swiftc -O -target arm64-apple-macos14.0 Sources/main.swift -o "$APP/Contents/MacOS/AudreyTalk"
+          cp scripts/Info.plist "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+          ditto -c -k --keepParent "$APP" AudreyTalk.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudreyTalk-app
+          path: AudreyTalk.zip
+          retention-days: 3
+          compression-level: 0
