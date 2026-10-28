@@ -93,6 +93,11 @@ final class Listener {
     try? input.setVoiceProcessingEnabled(true)
     input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buf, _ in self?.req?.append(buf) }
     do { try engine.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
+    // Headphones or another microphone switched in stop the engine; start it again on the new one.
+    NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+      guard let self, !self.paused else { return }
+      do { try self.engine.start(); self.restart() } catch { send(["type": "error", "message": "The microphone changed and could not restart: \(error.localizedDescription)"]) }
+    }
     begin()
     send(["type": "ready"])
   }
@@ -111,8 +116,8 @@ final class Listener {
           let t = res.bestTranscription.formattedString
           if t != self.text { self.text = t; send(["type": "partial", "text": t]); self.arm() }
           if res.isFinal { self.finish() }
-        } else if err != nil { // a long quiet stretch ends the task; listen again after a beat, so a lasting error cannot spin
-          self.restart(after: 0.5)
+        } else if err != nil { // a long quiet stretch or the time limit ends the task; keep what was heard,
+          if !self.text.isEmpty { self.finish() } else { self.restart(after: 0.5) } // then listen again after a beat
         }
       }
     }
