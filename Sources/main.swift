@@ -73,7 +73,13 @@ func send(_ o: [String: String]) {
 final class Listener {
   let engine = AVAudioEngine()
   var r: SFSpeechRecognizer?
-  var req: SFSpeechAudioBufferRecognitionRequest?
+  // Read by the audio thread for every mic buffer; changed on the main thread.
+  private let lock = NSLock()
+  private var _req: SFSpeechAudioBufferRecognitionRequest?
+  var req: SFSpeechAudioBufferRecognitionRequest? {
+    get { lock.lock(); defer { lock.unlock() }; return _req }
+    set { lock.lock(); _req = newValue; lock.unlock() }
+  }
   var task: SFSpeechRecognitionTask?
   var text = ""
   var timer: Timer?
@@ -130,8 +136,14 @@ final class Listener {
     if delay == 0 { begin() } else { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in if self?.req == nil { self?.begin() } } }
   }
 
-  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = "" }
-  func resume() { guard paused else { return }; paused = false; begin() }
+  // Paused turns the microphone off, so the Mac's mic light goes out too.
+  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; engine.pause() }
+  func resume() {
+    guard paused else { return }
+    paused = false
+    do { try engine.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
+    begin()
+  }
 }
 
 let listener = Listener()
