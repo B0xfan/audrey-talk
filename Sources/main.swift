@@ -4,7 +4,8 @@
 //
 //   Audrey Talk.app --socket <path>   connects to the chat's socket and streams JSON lines:
 //       {"type":"ready"} {"type":"partial","text":…} {"type":"final","text":…} {"type":"error","message":…}
-//     and takes lines "pause", "resume", "quit". Exits when the socket closes.
+//     and takes lines "pause", "resume", "reset" (drop what it has heard so far), "quit". Exits when the
+//     socket closes. Only an Obsidian process may be on the other end.
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
 import AVFoundation
 import Foundation
@@ -46,9 +47,22 @@ guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --fi
 // The chat's socket.
 let fd = socket(AF_UNIX, SOCK_STREAM, 0)
 var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
-_ = withUnsafeMutableBytes(of: &addr.sun_path) { p in sockPath.utf8CString.withUnsafeBytes { p.copyMemory(from: $0.prefix(p.count - 1)) } }
+let pathBytes = Array(sockPath.utf8)
+if pathBytes.count >= MemoryLayout.size(ofValue: addr.sun_path) { exit(2) } // the rest stays zero, so the path ends
+withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: pathBytes) }
 let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
 if ok != 0 { exit(3) }
+// Only Obsidian (A4's chat) may hear John: the other end of the socket must be an Obsidian process,
+// and the socket must sit in this user's own temporary folder.
+func peerIsObsidian() -> Bool {
+  var pid: pid_t = 0; var len = socklen_t(MemoryLayout<pid_t>.size)
+  guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0, pid > 0 else { return false }
+  var buf = [CChar](repeating: 0, count: 4096)
+  guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
+  return String(cString: buf).hasPrefix("/Applications/Obsidian.app/Contents/")
+}
+let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path
+if !URL(fileURLWithPath: sockPath).resolvingSymlinksInPath().path.hasPrefix(tmp + "/") || !peerIsObsidian() { exit(4) }
 let out = FileHandle(fileDescriptor: fd)
 let outQ = DispatchQueue(label: "out")
 func send(_ o: [String: String]) {
@@ -142,6 +156,7 @@ Thread {
         switch line {
         case "pause": listener.pause()
         case "resume": listener.resume()
+        case "reset": if !listener.paused { listener.restart() }
         case "quit": exit(0)
         default: break
         }
