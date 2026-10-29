@@ -142,7 +142,7 @@ final class Listener {
   // background app on John's Mac (2026-10-29), while the capture session does.
   // shortcut: stays on the mic that was the default at start, switch to watching device changes if John uses headphones.
   lazy var mic = Capture { [weak self] s in self?.add(s) }
-  // Read by the mic queue for every buffer; changed on the main thread.
+  // Read by the mic queue for every buffer; changed by the chat-reading thread and the main thread.
   private let lock = NSLock()
   private var samples: [Float] = []
   private var generation = 0 // bumped by hold/release/reset, so a pass that started before it is thrown away
@@ -196,8 +196,9 @@ final class Listener {
     }
   }
 
-  // hold, release and reset change the sound on the thread that reads the chat, the moment the line comes in:
-  // done later on the main thread, a busy moment there cut his first word (2026-10-29). The rest runs on main.
+  // hold, release and reset change the sound on the thread that reads the chat, the moment the line comes in,
+  // so a busy main thread cannot cut his first word (a first word went missing once, 2026-10-29, cause unproven).
+  // The rest runs on main.
   func hold() {
     let got = Date(); var had = 0
     take { s, g, h in had = s.count; if s.count > preroll { s.removeFirst(s.count - preroll) }; g += 1; h = true }
