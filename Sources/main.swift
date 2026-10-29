@@ -14,7 +14,7 @@ import Speech
 
 let args = CommandLine.arguments
 func arg(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
-let silence: TimeInterval = 1.3 // a pause this long ends what John said
+let silence: TimeInterval = 5 // a pause this long ends what John said; time to think (John 2026-10-29)
 
 func authorize(_ done: @escaping (String?) -> Void) {
   SFSpeechRecognizer.requestAuthorization { st in
@@ -127,6 +127,7 @@ final class Listener {
   }
   var task: SFSpeechRecognitionTask?
   var text = ""
+  var said = "" // what he said before the recognizer ended a request mid-thought
   var timer: Timer?
   var paused = false
 
@@ -149,16 +150,16 @@ final class Listener {
     let req = SFSpeechAudioBufferRecognitionRequest()
     req.requiresOnDeviceRecognition = true
     req.shouldReportPartialResults = true
-    self.req = req; text = ""
+    self.req = req
     task = r.recognitionTask(with: req) { [weak self] res, err in
       DispatchQueue.main.async {
         guard let self, self.req === req else { return }
         if let res {
-          let t = res.bestTranscription.formattedString
+          let t = [self.said, res.bestTranscription.formattedString].filter { !$0.isEmpty }.joined(separator: " ")
           if t != self.text { self.text = t; send(["type": "partial", "text": t]); self.arm() }
-          if res.isFinal { self.finish() }
-        } else if err != nil { // a long quiet stretch or the time limit ends the task; keep what was heard,
-          if !self.text.isEmpty { self.finish() } else { self.restart(after: 0.5) } // then listen again after a beat
+          if res.isFinal { self.carryOn() }
+        } else if err != nil { // a quiet stretch or the time limit ends the request: keep what was heard and listen on,
+          if !self.text.isEmpty { self.carryOn() } else { self.restart(after: 0.5) } // the pause timer still sends it
         }
       }
     }
@@ -176,14 +177,17 @@ final class Listener {
     restart()
   }
 
+  // The recognizer ended the request but he may not be done: a new request continues the same message.
+  func carryOn() { req?.endAudio(); task?.cancel(); req = nil; task = nil; said = text; begin() }
+
   func restart(after delay: TimeInterval = 0) {
     timer?.invalidate()
-    req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""
+    req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; said = ""
     if delay == 0 { begin() } else { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in if self?.req == nil { self?.begin() } } }
   }
 
   // Paused turns the microphone off, so the Mac's mic light goes out too.
-  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; mic.stop() }
+  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; said = ""; mic.stop() }
   func resume() {
     guard paused else { return }
     paused = false
