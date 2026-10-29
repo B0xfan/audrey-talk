@@ -159,7 +159,7 @@ final class Listener {
           if t != self.text { self.text = t; send(["type": "partial", "text": t]); self.arm() }
           if res.isFinal { self.carryOn() }
         } else if err != nil { // a quiet stretch or the time limit ends the request: keep what was heard and listen on,
-          if !self.text.isEmpty { self.carryOn() } else { self.restart(after: 0.5) } // the pause timer still sends it
+          if !self.text.isEmpty { self.carryOn(after: 0.5) } else { self.restart(after: 0.5) } // the pause timer still sends it
         }
       }
     }
@@ -178,7 +178,10 @@ final class Listener {
   }
 
   // The recognizer ended the request but he may not be done: a new request continues the same message.
-  func carryOn() { req?.endAudio(); task?.cancel(); req = nil; task = nil; said = text; begin() }
+  func carryOn(after delay: TimeInterval = 0) {
+    req?.endAudio(); task?.cancel(); req = nil; task = nil; said = text
+    if delay == 0 { begin() } else { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in if self?.req == nil { self?.begin() } } }
+  }
 
   func restart(after delay: TimeInterval = 0) {
     timer?.invalidate()
