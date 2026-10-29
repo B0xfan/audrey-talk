@@ -11,9 +11,15 @@
 //     --debug adds {"type":"note"} lines (the hidden test reads them).
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
 //   Audrey Talk.app --mic             self-check of the live microphone (8 seconds).
+//   Audrey Talk.app --say <text> [--rate <r>]   speaks the text in Audrey's voice, then exits (the voice settings' Hear it).
+//
+// Audrey's voice is Kyutai Pocket TTS "azelma" through FluidAudio (John picked it by ear over Ava (Premium), 2026-10-29).
+// On the socket the chat sends `speak {"id":…,"text":…,"rate":…}` and `hush`; when the last sentence has played
+// the app sends {"type":"spoken","id":…}, with "error" if the voice could not be made.
 import AVFoundation
 import FluidAudio
 import Foundation
+import NaturalLanguage
 
 let args = CommandLine.arguments
 func arg(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
@@ -40,6 +46,63 @@ if let file = arg("--file") {
       try await loadModel()
       print(try await transcribe(try AudioConverter().resampleAudioFile(URL(fileURLWithPath: file)))); exit(0)
     } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
+  }
+  RunLoop.main.run()
+}
+
+// The voice model (about 770 MB) is downloaded once into FluidAudio's folder and loaded on first use.
+let tts = PocketTtsManager()
+var ttsLoad: Task<Void, Error>? // set on the main thread only
+@MainActor func loadVoice() async throws {
+  if ttsLoad == nil { ttsLoad = Task { try await tts.initialize() } }
+  try await ttsLoad!.value
+}
+
+// Plays one answer: each sentence is made while the one before it plays. Used on the main thread only.
+final class Speaker {
+  let engine = AVAudioEngine(), node = AVAudioPlayerNode(), pitch = AVAudioUnitTimePitch() // the rate changes speed, not pitch
+  let format = AVAudioFormat(standardFormatWithSampleRate: Double(PocketTtsConstants.audioSampleRate), channels: 1)!
+  var gen = 0 // bumped by every say and hush, so sentences of an older answer are dropped
+  init() {
+    engine.attach(node); engine.attach(pitch)
+    engine.connect(node, to: pitch, format: format); engine.connect(pitch, to: engine.mainMixerNode, format: format)
+  }
+  func say(_ text: String, rate: Float, done: @escaping (String?) -> Void) {
+    hush(); let g = gen
+    pitch.rate = min(max(rate, 0.5), 2)
+    let tok = NLTokenizer(unit: .sentence); tok.string = text
+    let parts = tok.tokens(for: text.startIndex..<text.endIndex).map { text[$0].trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    if parts.isEmpty { return done(nil) }
+    Task { @MainActor in
+      do {
+        try await loadVoice()
+        for (i, part) in parts.enumerated() {
+          let made = try await tts.synthesizeDetailed(text: part, voice: "azelma").samples
+          guard g == gen else { return }
+          let s = made.isEmpty ? [Float](repeating: 0, count: 1) : made
+          let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(s.count))!
+          buf.frameLength = buf.frameCapacity
+          s.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: s.count) }
+          if !engine.isRunning { try engine.start() }
+          let last = i == parts.count - 1
+          node.scheduleBuffer(buf, completionCallbackType: .dataPlayedBack) { _ in
+            if last { DispatchQueue.main.async { if g == self.gen { done(nil) } } }
+          }
+          node.play()
+        }
+      } catch { if g == gen { done(error.localizedDescription) } }
+    }
+  }
+  func hush() { gen += 1; node.stop() }
+}
+let speaker = Speaker()
+
+if let text = arg("--say") {
+  DispatchQueue.main.async {
+    speaker.say(text, rate: arg("--rate").flatMap(Float.init) ?? 1) { err in
+      if let err { print("ERROR " + err) }
+      exit(err == nil ? 0 : 1)
+    }
   }
   RunLoop.main.run()
 }
@@ -174,6 +237,7 @@ final class Listener {
         self.timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         send(["type": "ready"])
         if listenFor != nil { self.hold() } // the self-check holds the whole time
+        else { Task { @MainActor in try? await loadVoice() } } // so her first answer does not wait for it
       }
     }
   }
@@ -255,7 +319,14 @@ if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) {
       case "release": listener.release()
       case "reset": listener.reset()
       case "quit": exit(0)
-      default: break
+      case "hush": DispatchQueue.main.async { speaker.hush() }
+      default:
+        guard line.hasPrefix("speak "), let o = try? JSONSerialization.jsonObject(with: Data(line.dropFirst(6).utf8)) as? [String: Any],
+              let id = o["id"] as? String, let text = o["text"] as? String else { break }
+        let rate = (o["rate"] as? NSNumber)?.floatValue ?? 1
+        DispatchQueue.main.async {
+          speaker.say(text, rate: rate) { err in send(["type": "spoken", "id": id].merging(err.map { ["error": $0] } ?? [:]) { a, _ in a }) }
+        }
       }
     }
   }
