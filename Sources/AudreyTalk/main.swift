@@ -68,10 +68,11 @@ final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
   func stop() { q.async { self.session.stopRunning() } }
   func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
     guard let block = CMSampleBufferGetDataBuffer(sb) else { return }
-    var len = 0; var ptr: UnsafeMutablePointer<CChar>?
-    guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &len, dataPointerOut: &ptr) == noErr, let ptr else { return }
+    // Copied, not pointed at: the buffer can come in more than one piece.
+    var out = [Float](repeating: 0, count: CMBlockBufferGetDataLength(block) / 4)
+    guard !out.isEmpty, out.withUnsafeMutableBytes({ CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!) }) == noErr else { return }
     count += 1
-    onSamples(ptr.withMemoryRebound(to: Float.self, capacity: len / 4) { Array(UnsafeBufferPointer(start: $0, count: len / 4)) })
+    onSamples(out)
   }
 }
 
@@ -180,9 +181,10 @@ final class Listener {
     if snap.isEmpty { return }
     busy = true
     Task {
-      let t = (try? await transcribe(snap)) ?? text
+      let heard = try? await transcribe(snap)
       DispatchQueue.main.async {
         self.busy = false
+        guard let t = heard else { return } // a failed pass changes nothing; the next one tries again
         var current = false
         self.take { _, g in current = g == gen }
         guard current, !self.paused else { return }
