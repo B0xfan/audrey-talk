@@ -6,8 +6,8 @@
 //
 //   Audrey Talk.app --socket <path>   connects to the chat's socket and streams JSON lines:
 //       {"type":"ready"} {"type":"partial","text":…} {"type":"final","text":…} {"type":"error","message":…}
-//     and takes lines "pause", "resume", "reset" (drop what it has heard so far), "quit". Exits when the
-//     socket closes. Only an Obsidian process may be on the other end.
+//     and takes lines "hold" (John is holding space: start a message), "release" (send it as one final),
+//     "reset" (drop it unsent), "quit". Exits when the socket closes. Only an Obsidian process may be on the other end.
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
 //   Audrey Talk.app --mic             self-check of the live microphone (8 seconds).
 import AVFoundation
@@ -16,7 +16,6 @@ import Foundation
 
 let args = CommandLine.arguments
 func arg(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
-let silence: TimeInterval = 5 // a pause this long ends what John said; time to think (John 2026-10-29)
 let rate = 16_000.0 // what Parakeet takes: 16 kHz mono floats
 
 func authorize(_ done: @escaping (String?) -> Void) {
@@ -134,11 +133,9 @@ func send(_ o: [String: String]) {
 // Only in the --listen self-check: why a request ended.
 func note(_ s: String) { if listenFor != nil { send(["type": "note", "text": s]) } }
 
-func words(_ s: String) -> [String] { s.lowercased().split { !$0.isLetter && !$0.isNumber && $0 != "'" }.map(String.init) }
-assert(words("Flex logo. And also,") == words("flex logo and also"))
-
-// Hears what John says by writing out everything since he started talking, again every moment, so no word is
-// cut at the start or end; what he said goes to the chat after `silence` seconds with no new words.
+// Hears John only while he holds space in the chat (John 2026-10-29: always-on listening sent fan noise as "Uh").
+// A message starts with the last half second before "hold", so his first word is not cut; while he holds,
+// everything he has said is written out again every moment; "release" sends all of it as the message.
 final class Listener {
   // The mic is read through a capture session: an AVAudioEngine tap got no sound at all in this
   // background app on John's Mac (2026-10-29), while the capture session does.
@@ -147,18 +144,20 @@ final class Listener {
   // Read by the mic queue for every buffer; changed on the main thread.
   private let lock = NSLock()
   private var samples: [Float] = []
-  private var generation = 0 // bumped by reset/pause, so a pass that started before it is thrown away
+  private var generation = 0 // bumped by hold/release/reset, so a pass that started before it is thrown away
+  private var holding = false
   var text = ""
-  var lastChange = Date()
   var busy = false
-  var paused = false
   var loaded = false
   var timer: Timer?
-  let keep = Int(rate * 1.5) // while nothing is said, keep only the last moment, so the first word is never cut
-  let longest = Int(rate * 120) // one message is sent after two minutes of talking, at the latest
+  let preroll = Int(rate * 0.5)
 
-  func add(_ s: [Float]) { lock.lock(); samples += s; lock.unlock() }
-  func take(_ f: (inout [Float], inout Int) -> Void) { lock.lock(); f(&samples, &generation); lock.unlock() }
+  func add(_ s: [Float]) {
+    lock.lock(); samples += s
+    if !holding && samples.count > 2 * preroll { samples.removeFirst(samples.count - preroll) } // trimmed now and then, not per buffer
+    lock.unlock()
+  }
+  func take(_ f: (inout [Float], inout Int, inout Bool) -> Void) { lock.lock(); f(&samples, &generation, &holding); lock.unlock() }
 
   func start() {
     do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
@@ -170,49 +169,49 @@ final class Listener {
     Task {
       do { try await loadModel() } catch { return send(["type": "error", "message": "Could not load the speech model: \(error.localizedDescription)"]) }
       DispatchQueue.main.async {
-        self.loaded = true; self.reset()
+        self.loaded = true
         self.timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         send(["type": "ready"])
+        if listenFor != nil { self.hold() } // the self-check holds the whole time
       }
     }
   }
 
   func tick() {
-    guard loaded, !paused, !busy else { return }
-    var snap: [Float] = []; var gen = 0
-    take { s, g in snap = s; gen = g }
-    if snap.isEmpty { return }
+    guard loaded, !busy else { return }
+    var snap: [Float] = []; var gen = 0; var on = false
+    take { s, g, h in snap = s; gen = g; on = h }
+    guard on, !snap.isEmpty else { return }
     busy = true
     Task {
       let heard = try? await transcribe(snap)
       DispatchQueue.main.async {
         self.busy = false
-        guard let t = heard else { return } // a failed pass changes nothing; the next one tries again
         var current = false
-        self.take { _, g in current = g == gen }
-        guard current, !self.paused else { return }
-        if t.isEmpty { return self.take { s, _ in if s.count > self.keep { s.removeFirst(s.count - self.keep) } } }
-        // Only new words restart the pause: commas, full stops and capitals flicker from pass to pass.
-        if words(t) != words(self.text) { self.lastChange = Date() }
-        if t != self.text { self.text = t; send(["type": "partial", "text": t]) }
-        if Date().timeIntervalSince(self.lastChange) >= silence || snap.count >= self.longest {
-          send(["type": "final", "text": t]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
-          self.text = ""
-          self.take { s, g in s.removeFirst(min(snap.count, s.count)); g += 1 } // keep what came in during this pass
-        }
+        self.take { _, g, _ in current = g == gen }
+        guard current, let t = heard, !t.isEmpty, t != self.text else { return } // a failed pass changes nothing
+        self.text = t; send(["type": "partial", "text": t])
       }
     }
   }
 
-  func reset() { text = ""; take { s, g in s.removeAll(); g += 1 } }
+  func hold() { text = ""; take { s, g, h in if s.count > preroll { s.removeFirst(s.count - preroll) }; g += 1; h = true } }
 
-  // Paused turns the microphone off, so the Mac's mic light goes out too.
-  func pause() { paused = true; reset(); mic.stop() }
-  func resume() {
-    guard paused else { return }
-    paused = false; reset()
-    do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
+  // Always answers with one final, empty when nothing was held or heard, so the chat never waits on it.
+  func release(_ then: @escaping () -> Void = {}) {
+    var snap: [Float] = []
+    take { s, g, h in if h { snap = s; s.removeAll() }; g += 1; h = false }
+    text = ""
+    Task {
+      let t = snap.isEmpty ? "" : ((try? await transcribe(snap)) ?? "")
+      DispatchQueue.main.async {
+        send(["type": "final", "text": t]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
+        then()
+      }
+    }
   }
+
+  func reset() { text = ""; take { s, g, h in s.removeAll(); g += 1; h = false } }
 }
 
 let listener = Listener()
@@ -224,7 +223,7 @@ authorize { err in
 }
 
 // Commands from the chat; the socket closing (Obsidian quit, End talk) ends the app.
-if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) { exit(0) } } else { Thread {
+if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) { listener.release { outQ.sync {}; exit(0) } } } else { Thread {
   var buf = Data()
   var chunk = [UInt8](repeating: 0, count: 4096)
   while true {
@@ -235,8 +234,8 @@ if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) {
       let line = String(decoding: buf[buf.startIndex..<i], as: UTF8.self); buf = Data(buf[(i + 1)...])
       DispatchQueue.main.async {
         switch line {
-        case "pause": listener.pause()
-        case "resume": listener.resume()
+        case "hold": listener.hold()
+        case "release": listener.release()
         case "reset": listener.reset()
         case "quit": exit(0)
         default: break
