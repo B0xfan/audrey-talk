@@ -72,6 +72,7 @@ if let mode = arg("--mic") {
     guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
     print("mic permission \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
     print("default mic \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "none")")
+    let req = SFSpeechAudioBufferRecognitionRequest(); req.requiresOnDeviceRecognition = true
     if mode == "capture" {
       let cap = Capture { sb in req.appendAudioSampleBuffer(sb) }
       var heard = ""
@@ -90,7 +91,6 @@ if let mode = arg("--mic") {
     if mode == "on" { do { try input.setVoiceProcessingEnabled(true) } catch { print("VP error \(error)") } }
     let fmt = input.outputFormat(forBus: 0)
     print("format \(fmt)")
-    let req = SFSpeechAudioBufferRecognitionRequest(); req.requiresOnDeviceRecognition = true
     let lock = NSLock(); var n = 0; var peak: Float = 0
     input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in
       req.append(buf)
