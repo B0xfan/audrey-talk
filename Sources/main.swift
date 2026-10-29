@@ -67,6 +67,8 @@ if let mode = arg("--mic") {
       if let res { heard = res.bestTranscription.formattedString }
       if let e { print("task error \(e.localizedDescription)") }
     }
+    if mode == "pull" { engine.connect(input, to: engine.mainMixerNode, format: fmt); engine.mainMixerNode.outputVolume = 0 }
+    print("input device id \(input.auAudioUnit.deviceID)")
     do { try engine.start() } catch { print("ERROR start \(error)"); exit(1) }
     print("running \(engine.isRunning)")
     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
