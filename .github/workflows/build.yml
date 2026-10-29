@@ -4,7 +4,7 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build the app (signed later on John's Mac by scripts/install.sh)
@@ -12,7 +12,11 @@ jobs:
           set -euo pipefail
           APP="build/Audrey Talk.app"
           mkdir -p "$APP/Contents/MacOS"
-          swiftc -O -target arm64-apple-macos14.0 Sources/main.swift -o "$APP/Contents/MacOS/AudreyTalk"
+          swift build -c release --arch arm64
+          BIN=$(swift build -c release --arch arm64 --show-bin-path)
+          cp "$BIN/AudreyTalk" "$APP/Contents/MacOS/AudreyTalk"
+          mkdir -p "$APP/Contents/Resources"
+          for b in "$BIN"/*.bundle; do [ -e "$b" ] && ditto "$b" "$APP/Contents/Resources/$(basename "$b")"; done
           cp scripts/Info.plist "$APP/Contents/Info.plist"
           plutil -lint "$APP/Contents/Info.plist"
           ditto -c -k --keepParent "$APP" AudreyTalk.zip

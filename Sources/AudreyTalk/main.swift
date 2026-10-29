@@ -1,6 +1,8 @@
 // Audrey Talk: the listening half of talk mode in A4's chat with Audrey (John 2026-10-28).
-// A background app (no window, no Dock icon) so macOS asks for Microphone and Speech Recognition
-// in its own name; Obsidian's own Info.plist has no speech key, so it cannot ask itself.
+// A background app (no window, no Dock icon) so macOS asks for the Microphone in its own name.
+// Speech to text is FluidAudio's Parakeet (English v2) on the Neural Engine (John 2026-10-29): the Mac's own
+// recognizer dropped first and last words and ran a sentence behind. The model sits in
+// ~/Library/Application Support/FluidAudio/Models (FluidVoice shares it); it is downloaded once if missing.
 //
 //   Audrey Talk.app --socket <path>   connects to the chat's socket and streams JSON lines:
 //       {"type":"ready"} {"type":"partial","text":…} {"type":"final","text":…} {"type":"error","message":…}
@@ -9,52 +11,53 @@
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
 //   Audrey Talk.app --mic             self-check of the live microphone (8 seconds).
 import AVFoundation
+import FluidAudio
 import Foundation
-import Speech
 
 let args = CommandLine.arguments
 func arg(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
 let silence: TimeInterval = 5 // a pause this long ends what John said; time to think (John 2026-10-29)
+let rate = 16_000.0 // what Parakeet takes: 16 kHz mono floats
 
 func authorize(_ done: @escaping (String?) -> Void) {
-  SFSpeechRecognizer.requestAuthorization { st in
-    guard st == .authorized else { return done("Speech recognition is not allowed for Audrey Talk (System Settings, Privacy).") }
-    if args.contains("--file") { return done(nil) }
-    AVCaptureDevice.requestAccess(for: .audio) { ok in done(ok ? nil : "The microphone is not allowed for Audrey Talk (System Settings, Privacy).") }
-  }
+  if args.contains("--file") { return done(nil) }
+  AVCaptureDevice.requestAccess(for: .audio) { ok in done(ok ? nil : "The microphone is not allowed for Audrey Talk (System Settings, Privacy).") }
 }
 
-func recognizer() -> SFSpeechRecognizer? {
-  let r = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-  return (r?.supportsOnDeviceRecognition ?? false) ? r : nil
+// One recognizer, loaded once; transcribe calls are serialized by the actor.
+let asr = AsrManager(config: .default)
+func loadModel() async throws { try await asr.loadModels(try await AsrModels.downloadAndLoad(version: .v2)) }
+func transcribe(_ samples: [Float]) async throws -> String {
+  // Parakeet needs at least a second of audio; pad short bits with silence.
+  let padded = samples.count < Int(rate) ? samples + [Float](repeating: 0, count: Int(rate) - samples.count) : samples
+  var state = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
+  return try await asr.transcribe(padded, decoderState: &state).text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 if let file = arg("--file") {
-  authorize { err in
-    if let err { print("ERROR " + err); exit(1) }
-    guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
-    let req = SFSpeechURLRecognitionRequest(url: URL(fileURLWithPath: file))
-    req.requiresOnDeviceRecognition = true
-    r.recognitionTask(with: req) { res, e in
-      if let e { print("ERROR " + e.localizedDescription); exit(1) }
-      if let res, res.isFinal { print(res.bestTranscription.formattedString); exit(0) }
-    }
+  Task {
+    do {
+      try await loadModel()
+      print(try await transcribe(try AudioConverter().resampleAudioFile(URL(fileURLWithPath: file)))); exit(0)
+    } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
   }
   RunLoop.main.run()
 }
 
-// Reads the default microphone through a capture session and hands each sound buffer on.
+// Reads the default microphone through a capture session, already as 16 kHz mono floats, and hands them on.
 final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
   let session = AVCaptureSession()
   let q = DispatchQueue(label: "mic")
-  let onBuffer: (CMSampleBuffer) -> Void
+  let onSamples: ([Float]) -> Void
   private(set) var count = 0
-  init(_ onBuffer: @escaping (CMSampleBuffer) -> Void) { self.onBuffer = onBuffer }
+  init(_ onSamples: @escaping ([Float]) -> Void) { self.onSamples = onSamples }
   func start() throws {
     if !session.inputs.isEmpty { return q.async { self.session.startRunning() } }
     guard let dev = AVCaptureDevice.default(for: .audio) else { throw NSError(domain: "AudreyTalk", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone found."]) }
     let input = try AVCaptureDeviceInput(device: dev)
     let output = AVCaptureAudioDataOutput()
+    output.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: rate, AVNumberOfChannelsKey: 1,
+                            AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsNonInterleaved: false]
     output.setSampleBufferDelegate(self, queue: q)
     session.beginConfiguration()
     if session.canAddInput(input) { session.addInput(input) }
@@ -63,24 +66,32 @@ final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     q.async { self.session.startRunning() } // blocks while the mic opens, so not on the main thread
   }
   func stop() { q.async { self.session.stopRunning() } }
-  func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) { count += 1; onBuffer(sb) }
+  func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
+    guard let block = CMSampleBufferGetDataBuffer(sb) else { return }
+    var len = 0; var ptr: UnsafeMutablePointer<CChar>?
+    guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &len, dataPointerOut: &ptr) == noErr, let ptr else { return }
+    count += 1
+    onSamples(ptr.withMemoryRebound(to: Float.self, capacity: len / 4) { Array(UnsafeBufferPointer(start: $0, count: len / 4)) })
+  }
 }
 
 // Self-check of the live microphone: listens 8 seconds, then prints how many sound buffers came in and what it heard.
 if args.contains("--mic") {
-  authorize { err in DispatchQueue.main.async {
+  authorize { err in
     if let err { print("ERROR " + err); exit(1) }
-    guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
-    let req = SFSpeechAudioBufferRecognitionRequest(); req.requiresOnDeviceRecognition = true
-    let cap = Capture { req.appendAudioSampleBuffer($0) }
-    var heard = ""
-    r.recognitionTask(with: req) { res, _ in DispatchQueue.main.async { if let res { heard = res.bestTranscription.formattedString } } }
-    do { try cap.start() } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-      req.endAudio()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.q.sync { cap.count })"); print("heard: " + heard); exit(heard.isEmpty ? 1 : 0) }
+    let lock = NSLock(); var all: [Float] = []
+    let cap = Capture { s in lock.lock(); all += s; lock.unlock() }
+    Task {
+      do {
+        try await loadModel(); try cap.start()
+        try await Task.sleep(nanoseconds: 8_000_000_000); cap.stop()
+        lock.lock(); let s = all; lock.unlock()
+        let heard = try await transcribe(s)
+        print("buffers \(cap.q.sync { cap.count }), seconds \(String(format: "%.1f", Double(s.count) / rate))"); print("heard: " + heard)
+        exit(heard.isEmpty ? 1 : 0)
+      } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
     }
-  } }
+  }
   RunLoop.main.run()
 }
 
@@ -122,91 +133,78 @@ func send(_ o: [String: String]) {
 // Only in the --listen self-check: why a request ended.
 func note(_ s: String) { if listenFor != nil { send(["type": "note", "text": s]) } }
 
+// Hears what John says by writing out everything since he started talking, again every moment, so no word is
+// cut at the start or end; what he said goes to the chat after `silence` seconds with no new words.
 final class Listener {
   // The mic is read through a capture session: an AVAudioEngine tap got no sound at all in this
   // background app on John's Mac (2026-10-29), while the capture session does.
   // shortcut: stays on the mic that was the default at start, switch to watching device changes if John uses headphones.
-  lazy var mic = Capture { [weak self] sb in self?.req?.appendAudioSampleBuffer(sb) }
-  var r: SFSpeechRecognizer?
+  lazy var mic = Capture { [weak self] s in self?.add(s) }
   // Read by the mic queue for every buffer; changed on the main thread.
   private let lock = NSLock()
-  private var _req: SFSpeechAudioBufferRecognitionRequest?
-  var req: SFSpeechAudioBufferRecognitionRequest? {
-    get { lock.lock(); defer { lock.unlock() }; return _req }
-    set { lock.lock(); _req = newValue; lock.unlock() }
-  }
-  var task: SFSpeechRecognitionTask?
+  private var samples: [Float] = []
+  private var generation = 0 // bumped by reset/pause, so a pass that started before it is thrown away
   var text = ""
-  var said = "" // what he said before the recognizer ended a request mid-thought
-  var timer: Timer?
+  var lastChange = Date()
+  var busy = false
   var paused = false
+  var loaded = false
+  var timer: Timer?
+  let keep = Int(rate * 1.5) // while nothing is said, keep only the last moment, so the first word is never cut
+  let longest = Int(rate * 120) // one message is sent after two minutes of talking, at the latest
+
+  func add(_ s: [Float]) { lock.lock(); samples += s; lock.unlock() }
+  func take(_ f: (inout [Float], inout Int) -> Void) { lock.lock(); f(&samples, &generation); lock.unlock() }
 
   func start() {
-    guard let r = recognizer() else { return send(["type": "error", "message": "This Mac has no on-device English speech recognition."]) }
-    self.r = r
     do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
     // The session fails quietly otherwise (another app took the mic, or it went away).
     NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: mic.session, queue: .main) { n in
       let e = n.userInfo?[AVCaptureSessionErrorKey] as? Error
       send(["type": "error", "message": "The microphone stopped (\(e?.localizedDescription ?? "unknown reason")). End talk and start it again."])
     }
-    begin()
-    send(["type": "ready"])
+    Task {
+      do { try await loadModel() } catch { return send(["type": "error", "message": "Could not load the speech model: \(error.localizedDescription)"]) }
+      DispatchQueue.main.async {
+        self.loaded = true; self.reset()
+        self.timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        send(["type": "ready"])
+      }
+    }
   }
 
-  // One request per thing John says; a new one starts after each pause.
-  func begin() {
-    guard let r, !paused else { return }
-    let req = SFSpeechAudioBufferRecognitionRequest()
-    req.requiresOnDeviceRecognition = true
-    req.shouldReportPartialResults = true
-    self.req = req; note("request start")
-    task = r.recognitionTask(with: req) { [weak self] res, err in
+  func tick() {
+    guard loaded, !paused, !busy else { return }
+    var snap: [Float] = []; var gen = 0
+    take { s, g in snap = s; gen = g }
+    if snap.isEmpty { return }
+    busy = true
+    Task {
+      let t = (try? await transcribe(snap)) ?? text
       DispatchQueue.main.async {
-        guard let self, self.req === req else { return }
-        if let res {
-          let t = [self.said, res.bestTranscription.formattedString].filter { !$0.isEmpty }.joined(separator: " ")
-          if t != self.text { self.text = t; send(["type": "partial", "text": t]); self.arm() }
-          if res.isFinal { note("recognizer final"); self.carryOn() }
-        } else if let err { // a quiet stretch or the time limit ends the request: keep what was heard and listen on,
-          note("recognizer error: \(err.localizedDescription)")
-          if !self.text.isEmpty { self.carryOn(after: 0.5) } else { self.restart(after: 0.5) } // the pause timer still sends it
+        self.busy = false
+        var current = false
+        self.take { _, g in current = g == gen }
+        guard current, !self.paused else { return }
+        if t.isEmpty { return self.take { s, _ in if s.count > self.keep { s.removeFirst(s.count - self.keep) } } }
+        if t != self.text { self.text = t; self.lastChange = Date(); send(["type": "partial", "text": t]) }
+        if Date().timeIntervalSince(self.lastChange) >= silence || snap.count >= self.longest {
+          send(["type": "final", "text": t]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
+          self.text = ""
+          self.take { s, g in s.removeFirst(min(snap.count, s.count)); g += 1 } // keep what came in during this pass
         }
       }
     }
   }
 
-  func arm() {
-    timer?.invalidate()
-    timer = Timer.scheduledTimer(withTimeInterval: silence, repeats: false) { [weak self] _ in self?.finish() }
-  }
-
-  func finish() {
-    timer?.invalidate()
-    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !t.isEmpty { send(["type": "final", "text": t]) }
-    restart()
-  }
-
-  // The recognizer ended the request but he may not be done: a new request continues the same message.
-  func carryOn(after delay: TimeInterval = 0) {
-    req?.endAudio(); task?.cancel(); req = nil; task = nil; said = text
-    if delay == 0 { begin() } else { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in if self?.req == nil { self?.begin() } } }
-  }
-
-  func restart(after delay: TimeInterval = 0) {
-    timer?.invalidate()
-    req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; said = ""
-    if delay == 0 { begin() } else { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in if self?.req == nil { self?.begin() } } }
-  }
+  func reset() { text = ""; take { s, g in s.removeAll(); g += 1 } }
 
   // Paused turns the microphone off, so the Mac's mic light goes out too.
-  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; said = ""; mic.stop() }
+  func pause() { paused = true; reset(); mic.stop() }
   func resume() {
     guard paused else { return }
-    paused = false
+    paused = false; reset()
     do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
-    begin()
   }
 }
 
@@ -232,7 +230,7 @@ if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) {
         switch line {
         case "pause": listener.pause()
         case "resume": listener.resume()
-        case "reset": if !listener.paused { listener.restart() }
+        case "reset": listener.reset()
         case "quit": exit(0)
         default: break
         }

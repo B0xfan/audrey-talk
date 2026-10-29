@@ -11,6 +11,5 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Audrey Talk listens so you can talk with Audrey in Obsidian.</string>
-  <key>NSSpeechRecognitionUsageDescription</key><string>Audrey Talk turns what you say into text for Audrey, on this Mac.</string>
 </dict>
 </plist>
