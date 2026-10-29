@@ -1,0 +1,35 @@
+# Scratch: one-off voice samples for John to compare (2026-10-29). This branch is deleted after.
+name: voice-samples
+on:
+  push:
+    branches: [voice-samples]
+jobs:
+  samples:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Build the FluidAudio speech tool
+        run: |
+          git clone --depth 1 --branch v0.18.0 https://github.com/FluidInference/FluidAudio.git fa
+          cd fa && swift build -c release --product fluidaudiocli
+      - name: Make the samples
+        run: |
+          set +e
+          cd fa; BIN=$(swift build -c release --show-bin-path)/fluidaudiocli; mkdir -p ../out
+          T="Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store."
+          run() { name=$1; shift; echo "== $name"; "$BIN" tts "$T" "$@" --output ../out/$name.wav 2>&1 | tail -5; }
+          run kokoro-heart --backend kokoro-ane --kokoro-version v3 --voice af_heart
+          run kokoro-bella --backend kokoro-ane --kokoro-version v3 --voice af_bella
+          run pocket-alba --backend pocket --voice alba
+          run pocket-azelma --backend pocket --voice azelma
+          run pocket-eponine --backend pocket --voice eponine
+          run phonon-zoey --backend pocket-small --model phonon --voice en_us_Zoey
+          run phonon-maeve --backend pocket-small --model phonon --voice en_gb_Maeve
+          run chatterbox-nano --backend chatterbox-nano --seed 42
+          run supertonic --backend supertonic3
+          ls -la ../out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-samples
+          path: out
+          retention-days: 3
