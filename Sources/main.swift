@@ -42,7 +42,42 @@ if let file = arg("--file") {
   RunLoop.main.run()
 }
 
-guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio>"); exit(2) }
+// Self-check of the live microphone: listens 8 seconds, then prints buffers, loudest level and what it heard.
+// --mic on uses echo cancelling (as talk mode does), --mic off does not.
+if let mode = arg("--mic") {
+  authorize { err in
+    if let err { print("ERROR " + err); exit(1) }
+    guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
+    let engine = AVAudioEngine(), input = engine.inputNode
+    if mode == "on" { do { try input.setVoiceProcessingEnabled(true) } catch { print("VP error \(error)") } }
+    let fmt = input.outputFormat(forBus: 0)
+    print("format \(fmt)")
+    let req = SFSpeechAudioBufferRecognitionRequest(); req.requiresOnDeviceRecognition = true
+    let lock = NSLock(); var n = 0; var peak: Float = 0
+    input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in
+      req.append(buf)
+      var p: Float = 0
+      if let ch = buf.floatChannelData { for i in 0..<Int(buf.frameLength) { p = max(p, abs(ch[0][i])) } }
+      lock.lock(); n += 1; peak = max(peak, p); lock.unlock()
+    }
+    var heard = ""
+    r.recognitionTask(with: req) { res, e in
+      if let res { heard = res.bestTranscription.formattedString }
+      if let e { print("task error \(e.localizedDescription)") }
+    }
+    do { try engine.start() } catch { print("ERROR start \(error)"); exit(1) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+      req.endAudio()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+        lock.lock(); print("buffers \(n) peak \(peak)"); lock.unlock()
+        print("heard: " + heard); exit(0)
+      }
+    }
+  }
+  RunLoop.main.run()
+}
+
+guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio> | --mic on|off"); exit(2) }
 
 // The chat's socket.
 let fd = socket(AF_UNIX, SOCK_STREAM, 0)
