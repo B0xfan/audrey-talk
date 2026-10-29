@@ -12,23 +12,48 @@ jobs:
         run: |
           git clone --depth 1 --branch v0.18.0 https://github.com/FluidInference/FluidAudio.git fa
           cd fa && swift build -c release --product fluidaudiocli
-      - name: Make the samples
+      - name: kokoro-heart
+        timeout-minutes: 8
+        continue-on-error: true
         run: |
-          set +e
-          cd fa; BIN=$(swift build -c release --show-bin-path)/fluidaudiocli; mkdir -p ../out
-          T="Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store."
-          run() { name=$1; shift; echo "== $name"; "$BIN" tts "$T" "$@" --output ../out/$name.wav 2>&1 | tail -5; }
-          run kokoro-heart --backend kokoro-ane --kokoro-version v3 --voice af_heart
-          run kokoro-bella --backend kokoro-ane --kokoro-version v3 --voice af_bella
-          run pocket-alba --backend pocket --voice alba
-          run pocket-azelma --backend pocket --voice azelma
-          run pocket-eponine --backend pocket --voice eponine
-          run phonon-zoey --backend pocket-small --model phonon --voice en_us_Zoey
-          run phonon-maeve --backend pocket-small --model phonon --voice en_gb_Maeve
-          run chatterbox-nano --backend chatterbox-nano --seed 42
-          run supertonic --backend supertonic3
-          ls -la ../out
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend kokoro-ane --kokoro-version v3 --voice af_heart --output ../out/kokoro-heart.wav 2>&1 | tail -20
+      - name: kokoro-bella
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend kokoro-ane --kokoro-version v3 --voice af_bella --output ../out/kokoro-bella.wav 2>&1 | tail -20
+      - name: phonon-zoey
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend pocket-small --model phonon --voice en_us_Zoey --output ../out/phonon-zoey.wav 2>&1 | tail -20
+      - name: phonon-maeve
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend pocket-small --model phonon --voice en_gb_Maeve --output ../out/phonon-maeve.wav 2>&1 | tail -20
+      - name: pocket-alba
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend pocket --voice alba --output ../out/pocket-alba.wav 2>&1 | tail -20
+      - name: pocket-azelma
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend pocket --voice azelma --output ../out/pocket-azelma.wav 2>&1 | tail -20
+      - name: chatterbox-nano
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend chatterbox-nano --seed 42 --output ../out/chatterbox-nano.wav 2>&1 | tail -20
+      - name: supertonic
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          mkdir -p out; cd fa; "$(swift build -c release --show-bin-path)/fluidaudiocli" tts "Here is your list for today. First, call Fabi about the blue dresses. Second, check the shipping rates on the store." --backend supertonic3 --output ../out/supertonic.wav 2>&1 | tail -20
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: voice-samples
           path: out
