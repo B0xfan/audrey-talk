@@ -42,6 +42,28 @@ if let file = arg("--file") {
   RunLoop.main.run()
 }
 
+// Reads the default microphone through a capture session and hands each sound buffer on.
+final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+  let session = AVCaptureSession()
+  let q = DispatchQueue(label: "mic")
+  let onBuffer: (CMSampleBuffer) -> Void
+  private(set) var count = 0
+  init(_ onBuffer: @escaping (CMSampleBuffer) -> Void) { self.onBuffer = onBuffer }
+  func start() throws {
+    guard let dev = AVCaptureDevice.default(for: .audio) else { throw NSError(domain: "AudreyTalk", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone found."]) }
+    let input = try AVCaptureDeviceInput(device: dev)
+    let output = AVCaptureAudioDataOutput()
+    output.setSampleBufferDelegate(self, queue: q)
+    session.beginConfiguration()
+    if session.canAddInput(input) { session.addInput(input) }
+    if session.canAddOutput(output) { session.addOutput(output) }
+    session.commitConfiguration()
+    session.startRunning()
+  }
+  func stop() { session.stopRunning() }
+  func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) { count += 1; onBuffer(sb) }
+}
+
 // Self-check of the live microphone: listens 8 seconds, then prints buffers, loudest level and what it heard.
 // --mic on uses echo cancelling (as talk mode does), --mic off does not.
 if let mode = arg("--mic") {
@@ -50,6 +72,20 @@ if let mode = arg("--mic") {
     guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
     print("mic permission \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
     print("default mic \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "none")")
+    if mode == "capture" {
+      let cap = Capture { sb in req.appendAudioSampleBuffer(sb) }
+      var heard = ""
+      r.recognitionTask(with: req) { res, e in
+        if let res { heard = res.bestTranscription.formattedString }
+        if let e { print("task error \(e.localizedDescription)") }
+      }
+      do { try cap.start() } catch { print("ERROR \(error)"); exit(1) }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+        req.endAudio()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.count)"); print("heard: " + heard); exit(0) }
+      }
+      return
+    }
     let engine = AVAudioEngine(), input = engine.inputNode
     if mode == "on" { do { try input.setVoiceProcessingEnabled(true) } catch { print("VP error \(error)") } }
     let fmt = input.outputFormat(forBus: 0)
