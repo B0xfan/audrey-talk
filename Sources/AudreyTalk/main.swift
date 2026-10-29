@@ -197,15 +197,26 @@ final class Listener {
 
   func hold() { text = ""; take { s, g, h in if s.count > preroll { s.removeFirst(s.count - preroll) }; g += 1; h = true } }
 
-  // Always answers with one final, empty when nothing was held or heard, so the chat never waits on it.
+  // Always answers with one final, empty when nothing was held or heard, so the chat never waits on it;
+  // "missed" when the speech model failed, so the chat can tell him to say it again.
+  // shortcut: no cap on one hold (the old one was 2 minutes); add one if a hold that long ever fails.
   func release(_ then: @escaping () -> Void = {}) {
     var snap: [Float] = []
     take { s, g, h in if h { snap = s; s.removeAll() }; g += 1; h = false }
     text = ""
+    finish(snap, then)
+  }
+
+  // One pass on the model at a time: waits for a moment-by-moment pass still running; new ones wait for this.
+  private func finish(_ snap: [Float], _ then: @escaping () -> Void) {
+    if busy { return DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { self.finish(snap, then) } }
+    busy = true
     Task {
-      let t = snap.isEmpty ? "" : ((try? await transcribe(snap)) ?? "")
+      var t: String? = ""
+      if !snap.isEmpty { t = try? await transcribe(snap) }
       DispatchQueue.main.async {
-        send(["type": "final", "text": t]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
+        self.busy = false
+        send(t.map { ["type": "final", "text": $0] } ?? ["type": "final", "text": "", "missed": "true"]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
         then()
       }
     }
