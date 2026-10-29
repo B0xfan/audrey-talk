@@ -8,6 +8,7 @@
 //       {"type":"ready"} {"type":"partial","text":…} {"type":"final","text":…} {"type":"error","message":…}
 //     and takes lines "hold" (John is holding space: start a message), "release" (send it as one final),
 //     "reset" (drop it unsent), "quit". Exits when the socket closes. Only an Obsidian process may be on the other end.
+//     --debug adds {"type":"note"} lines (the hidden test reads them).
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
 //   Audrey Talk.app --mic             self-check of the live microphone (8 seconds).
 import AVFoundation
@@ -130,8 +131,8 @@ func send(_ o: [String: String]) {
   guard let d = try? JSONSerialization.data(withJSONObject: o) else { return }
   outQ.async { try? out.write(contentsOf: d + Data([10])) }
 }
-// Only in the --listen self-check: why a request ended.
-func note(_ s: String) { if listenFor != nil { send(["type": "note", "text": s]) } }
+// Only in the --listen self-check and with --debug: timings and why a request ended.
+func note(_ s: String) { if listenFor != nil || args.contains("--debug") { send(["type": "note", "text": s]) } }
 
 // Hears John only while he holds space in the chat (John 2026-10-29: always-on listening sent fan noise as "Uh").
 // A message starts with the last half second before "hold", so his first word is not cut; while he holds,
@@ -195,7 +196,13 @@ final class Listener {
     }
   }
 
-  func hold() { text = ""; take { s, g, h in if s.count > preroll { s.removeFirst(s.count - preroll) }; g += 1; h = true } }
+  // hold, release and reset change the sound on the thread that reads the chat, the moment the line comes in:
+  // done later on the main thread, a busy moment there cut his first word (2026-10-29). The rest runs on main.
+  func hold() {
+    let got = Date(); var had = 0
+    take { s, g, h in had = s.count; if s.count > preroll { s.removeFirst(s.count - preroll) }; g += 1; h = true }
+    DispatchQueue.main.async { self.text = ""; note("hold: \(String(format: "%.1f", Double(had) / rate)) s before it, main thread \(Int(Date().timeIntervalSince(got) * 1000)) ms behind") }
+  }
 
   // Always answers with one final, empty when nothing was held or heard, so the chat never waits on it;
   // "missed" when the speech model failed, so the chat can tell him to say it again.
@@ -203,8 +210,7 @@ final class Listener {
   func release(_ then: @escaping () -> Void = {}) {
     var snap: [Float] = []
     take { s, g, h in if h { snap = s; s.removeAll() }; g += 1; h = false }
-    text = ""
-    finish(snap, then)
+    DispatchQueue.main.async { self.text = ""; self.finish(snap, then) }
   }
 
   // One pass on the model at a time: waits for a moment-by-moment pass still running; new ones wait for this.
@@ -222,7 +228,7 @@ final class Listener {
     }
   }
 
-  func reset() { text = ""; take { s, g, h in s.removeAll(); g += 1; h = false } }
+  func reset() { take { s, g, h in s.removeAll(); g += 1; h = false }; DispatchQueue.main.async { self.text = "" } }
 }
 
 let listener = Listener()
@@ -243,14 +249,12 @@ if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) {
     buf.append(contentsOf: chunk[0..<n])
     while let i = buf.firstIndex(of: 10) {
       let line = String(decoding: buf[buf.startIndex..<i], as: UTF8.self); buf = Data(buf[(i + 1)...])
-      DispatchQueue.main.async {
-        switch line {
-        case "hold": listener.hold()
-        case "release": listener.release()
-        case "reset": listener.reset()
-        case "quit": exit(0)
-        default: break
-        }
+      switch line {
+      case "hold": listener.hold()
+      case "release": listener.release()
+      case "reset": listener.reset()
+      case "quit": exit(0)
+      default: break
       }
     }
   }
