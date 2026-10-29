@@ -7,6 +7,7 @@
 //     and takes lines "pause", "resume", "reset" (drop what it has heard so far), "quit". Exits when the
 //     socket closes. Only an Obsidian process may be on the other end.
 //   Audrey Talk.app --file <audio>    self-check: prints what it hears in the file, then exits.
+//   Audrey Talk.app --mic             self-check of the live microphone (8 seconds).
 import AVFoundation
 import Foundation
 import Speech
@@ -50,6 +51,7 @@ final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
   private(set) var count = 0
   init(_ onBuffer: @escaping (CMSampleBuffer) -> Void) { self.onBuffer = onBuffer }
   func start() throws {
+    if !session.inputs.isEmpty { return q.async { self.session.startRunning() } }
     guard let dev = AVCaptureDevice.default(for: .audio) else { throw NSError(domain: "AudreyTalk", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone found."]) }
     let input = try AVCaptureDeviceInput(device: dev)
     let output = AVCaptureAudioDataOutput()
@@ -58,67 +60,31 @@ final class Capture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     if session.canAddInput(input) { session.addInput(input) }
     if session.canAddOutput(output) { session.addOutput(output) }
     session.commitConfiguration()
-    session.startRunning()
+    q.async { self.session.startRunning() } // blocks while the mic opens, so not on the main thread
   }
-  func stop() { session.stopRunning() }
+  func stop() { q.async { self.session.stopRunning() } }
   func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) { count += 1; onBuffer(sb) }
 }
 
-// Self-check of the live microphone: listens 8 seconds, then prints buffers, loudest level and what it heard.
-// --mic on uses echo cancelling (as talk mode does), --mic off does not.
-if let mode = arg("--mic") {
+// Self-check of the live microphone: listens 8 seconds, then prints how many sound buffers came in and what it heard.
+if args.contains("--mic") {
   authorize { err in DispatchQueue.main.async {
     if let err { print("ERROR " + err); exit(1) }
     guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
-    print("mic permission \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
-    print("default mic \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "none")")
     let req = SFSpeechAudioBufferRecognitionRequest(); req.requiresOnDeviceRecognition = true
-    if mode == "capture" {
-      let cap = Capture { sb in req.appendAudioSampleBuffer(sb) }
-      var heard = ""
-      r.recognitionTask(with: req) { res, e in
-        if let res { heard = res.bestTranscription.formattedString }
-        if let e { print("task error \(e.localizedDescription)") }
-      }
-      do { try cap.start() } catch { print("ERROR \(error)"); exit(1) }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-        req.endAudio()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.count)"); print("heard: " + heard); exit(0) }
-      }
-      return
-    }
-    let engine = AVAudioEngine(), input = engine.inputNode
-    if mode == "on" { do { try input.setVoiceProcessingEnabled(true) } catch { print("VP error \(error)") } }
-    let fmt = input.outputFormat(forBus: 0)
-    print("format \(fmt)")
-    let lock = NSLock(); var n = 0; var peak: Float = 0
-    input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in
-      req.append(buf)
-      var p: Float = 0
-      if let ch = buf.floatChannelData { for i in 0..<Int(buf.frameLength) { p = max(p, abs(ch[0][i])) } }
-      lock.lock(); n += 1; peak = max(peak, p); lock.unlock()
-    }
+    let cap = Capture { req.appendAudioSampleBuffer($0) }
     var heard = ""
-    r.recognitionTask(with: req) { res, e in
-      if let res { heard = res.bestTranscription.formattedString }
-      if let e { print("task error \(e.localizedDescription)") }
-    }
-    if mode == "pull" { engine.connect(input, to: engine.mainMixerNode, format: fmt); engine.mainMixerNode.outputVolume = 0 }
-    print("input device id \(input.auAudioUnit.deviceID)")
-    do { try engine.start() } catch { print("ERROR start \(error)"); exit(1) }
-    print("running \(engine.isRunning)")
+    r.recognitionTask(with: req) { res, _ in DispatchQueue.main.async { if let res { heard = res.bestTranscription.formattedString } } }
+    do { try cap.start() } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
       req.endAudio()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-        lock.lock(); print("buffers \(n) peak \(peak)"); lock.unlock()
-        print("heard: " + heard); exit(0)
-      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.count)"); print("heard: " + heard); exit(heard.isEmpty ? 1 : 0) }
     }
   } }
   RunLoop.main.run()
 }
 
-guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio> | --mic on|off"); exit(2) }
+guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio> | --mic"); exit(2) }
 
 // The chat's socket.
 let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -147,9 +113,12 @@ func send(_ o: [String: String]) {
 }
 
 final class Listener {
-  let engine = AVAudioEngine()
+  // The mic is read through a capture session: an AVAudioEngine tap got no sound at all in this
+  // background app on John's Mac (2026-10-29), while the capture session does.
+  // shortcut: stays on the mic that was the default at start, switch to watching device changes if John uses headphones.
+  lazy var mic = Capture { [weak self] sb in self?.req?.appendAudioSampleBuffer(sb) }
   var r: SFSpeechRecognizer?
-  // Read by the audio thread for every mic buffer; changed on the main thread.
+  // Read by the mic queue for every buffer; changed on the main thread.
   private let lock = NSLock()
   private var _req: SFSpeechAudioBufferRecognitionRequest?
   var req: SFSpeechAudioBufferRecognitionRequest? {
@@ -164,16 +133,7 @@ final class Listener {
   func start() {
     guard let r = recognizer() else { return send(["type": "error", "message": "This Mac has no on-device English speech recognition."]) }
     self.r = r
-    let input = engine.inputNode
-    // Echo cancelling, so Audrey's voice from the speakers is less likely to be heard as John.
-    try? input.setVoiceProcessingEnabled(true)
-    input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buf, _ in self?.req?.append(buf) }
-    do { try engine.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
-    // Headphones or another microphone switched in stop the engine; start it again on the new one.
-    NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-      guard let self, !self.paused else { return }
-      do { try self.engine.start(); self.restart() } catch { send(["type": "error", "message": "The microphone changed and could not restart: \(error.localizedDescription)"]) }
-    }
+    do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
     begin()
     send(["type": "ready"])
   }
@@ -218,11 +178,11 @@ final class Listener {
   }
 
   // Paused turns the microphone off, so the Mac's mic light goes out too.
-  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; engine.pause() }
+  func pause() { paused = true; timer?.invalidate(); req?.endAudio(); task?.cancel(); req = nil; task = nil; text = ""; mic.stop() }
   func resume() {
     guard paused else { return }
     paused = false
-    do { try engine.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
+    do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
     begin()
   }
 }
