@@ -45,9 +45,11 @@ if let file = arg("--file") {
 // Self-check of the live microphone: listens 8 seconds, then prints buffers, loudest level and what it heard.
 // --mic on uses echo cancelling (as talk mode does), --mic off does not.
 if let mode = arg("--mic") {
-  authorize { err in
+  authorize { err in DispatchQueue.main.async {
     if let err { print("ERROR " + err); exit(1) }
     guard let r = recognizer() else { print("ERROR no on-device English recognition"); exit(1) }
+    print("mic permission \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
+    print("default mic \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "none")")
     let engine = AVAudioEngine(), input = engine.inputNode
     if mode == "on" { do { try input.setVoiceProcessingEnabled(true) } catch { print("VP error \(error)") } }
     let fmt = input.outputFormat(forBus: 0)
@@ -66,6 +68,7 @@ if let mode = arg("--mic") {
       if let e { print("task error \(e.localizedDescription)") }
     }
     do { try engine.start() } catch { print("ERROR start \(error)"); exit(1) }
+    print("running \(engine.isRunning)")
     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
       req.endAudio()
       DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -73,7 +76,7 @@ if let mode = arg("--mic") {
         print("heard: " + heard); exit(0)
       }
     }
-  }
+  } }
   RunLoop.main.run()
 }
 
