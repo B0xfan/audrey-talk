@@ -15,7 +15,7 @@
 //
 // Audrey's voice is Kyutai Pocket TTS "azelma" through FluidAudio (John picked it by ear over Ava (Premium), 2026-10-29).
 // On the socket the chat sends `speak {"id":…,"text":…,"rate":…}` and `hush`; when the last sentence has played
-// the app sends {"type":"spoken","id":…}, with "error" if the voice could not be made.
+// the app sends {"type":"spoken","id":…}, with "error" and "rest" (the sentences not yet played) if the voice could not be made.
 import AVFoundation
 import FluidAudio
 import Foundation
@@ -67,16 +67,18 @@ final class Speaker {
     engine.attach(node); engine.attach(pitch)
     engine.connect(node, to: pitch, format: format); engine.connect(pitch, to: engine.mainMixerNode, format: format)
   }
-  func say(_ text: String, rate: Float, done: @escaping (String?) -> Void) {
+  func say(_ text: String, rate: Float, done: @escaping (_ error: String?, _ rest: String) -> Void) {
     hush(); let g = gen
     pitch.rate = min(max(rate, 0.5), 2)
     let tok = NLTokenizer(unit: .sentence); tok.string = text
     let parts = tok.tokens(for: text.startIndex..<text.endIndex).map { text[$0].trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-    if parts.isEmpty { return done(nil) }
+    if parts.isEmpty { return done(nil, "") }
+    var next = 0 // the first sentence not yet handed to the player
     Task { @MainActor in
       do {
         try await loadVoice()
         for (i, part) in parts.enumerated() {
+          next = i
           let made = try await tts.synthesizeDetailed(text: part, voice: "azelma").samples
           guard g == gen else { return }
           let s = made.isEmpty ? [Float](repeating: 0, count: 1) : made
@@ -86,11 +88,11 @@ final class Speaker {
           if !engine.isRunning { try engine.start() }
           let last = i == parts.count - 1
           node.scheduleBuffer(buf, completionCallbackType: .dataPlayedBack) { _ in
-            if last { DispatchQueue.main.async { if g == self.gen { done(nil) } } }
+            if last { DispatchQueue.main.async { if g == self.gen { done(nil, "") } } }
           }
           node.play()
         }
-      } catch { if g == gen { done(error.localizedDescription) } }
+      } catch { if g == gen { done(error.localizedDescription, parts[next...].joined(separator: " ")) } }
     }
   }
   func hush() { gen += 1; node.stop() }
@@ -99,7 +101,7 @@ let speaker = Speaker()
 
 if let text = arg("--say") {
   DispatchQueue.main.async {
-    speaker.say(text, rate: arg("--rate").flatMap(Float.init) ?? 1) { err in
+    speaker.say(text, rate: arg("--rate").flatMap(Float.init) ?? 1) { err, _ in
       if let err { print("ERROR " + err) }
       exit(err == nil ? 0 : 1)
     }
@@ -325,7 +327,7 @@ if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) {
               let id = o["id"] as? String, let text = o["text"] as? String else { break }
         let rate = (o["rate"] as? NSNumber)?.floatValue ?? 1
         DispatchQueue.main.async {
-          speaker.say(text, rate: rate) { err in send(["type": "spoken", "id": id].merging(err.map { ["error": $0] } ?? [:]) { a, _ in a }) }
+          speaker.say(text, rate: rate) { err, rest in send(["type": "spoken", "id": id].merging(err.map { ["error": $0, "rest": rest] } ?? [:]) { a, _ in a }) }
         }
       }
     }
