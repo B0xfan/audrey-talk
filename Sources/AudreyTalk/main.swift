@@ -134,6 +134,9 @@ func send(_ o: [String: String]) {
 // Only in the --listen self-check: why a request ended.
 func note(_ s: String) { if listenFor != nil { send(["type": "note", "text": s]) } }
 
+func words(_ s: String) -> [String] { s.lowercased().split { !$0.isLetter && !$0.isNumber && $0 != "'" }.map(String.init) }
+assert(words("Flex logo. And also,") == words("flex logo and also"))
+
 // Hears what John says by writing out everything since he started talking, again every moment, so no word is
 // cut at the start or end; what he said goes to the chat after `silence` seconds with no new words.
 final class Listener {
@@ -189,7 +192,9 @@ final class Listener {
         self.take { _, g in current = g == gen }
         guard current, !self.paused else { return }
         if t.isEmpty { return self.take { s, _ in if s.count > self.keep { s.removeFirst(s.count - self.keep) } } }
-        if t != self.text { self.text = t; self.lastChange = Date(); send(["type": "partial", "text": t]) }
+        // Only new words restart the pause: commas, full stops and capitals flicker from pass to pass.
+        if words(t) != words(self.text) { self.lastChange = Date() }
+        if t != self.text { self.text = t; send(["type": "partial", "text": t]) }
         if Date().timeIntervalSince(self.lastChange) >= silence || snap.count >= self.longest {
           send(["type": "final", "text": t]); note("sent after \(String(format: "%.1f", Double(snap.count) / rate)) s of sound")
           self.text = ""
