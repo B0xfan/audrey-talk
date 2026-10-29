@@ -78,7 +78,7 @@ if args.contains("--mic") {
     do { try cap.start() } catch { print("ERROR \(error.localizedDescription)"); exit(1) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
       req.endAudio()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.count)"); print("heard: " + heard); exit(heard.isEmpty ? 1 : 0) }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { print("buffers \(cap.q.sync { cap.count })"); print("heard: " + heard); exit(heard.isEmpty ? 1 : 0) }
     }
   } }
   RunLoop.main.run()
@@ -137,7 +137,7 @@ final class Listener {
     // The session fails quietly otherwise (another app took the mic, or it went away).
     NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: mic.session, queue: .main) { n in
       let e = n.userInfo?[AVCaptureSessionErrorKey] as? Error
-      send(["type": "error", "message": "The microphone stopped: \(e?.localizedDescription ?? "unknown reason")"])
+      send(["type": "error", "message": "The microphone stopped (\(e?.localizedDescription ?? "unknown reason")). End talk and start it again."])
     }
     begin()
     send(["type": "ready"])
