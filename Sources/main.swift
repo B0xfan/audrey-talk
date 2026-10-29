@@ -84,33 +84,43 @@ if args.contains("--mic") {
   RunLoop.main.run()
 }
 
-guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio> | --mic"); exit(2) }
-
-// The chat's socket.
-let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
-let pathBytes = Array(sockPath.utf8)
-if pathBytes.count >= MemoryLayout.size(ofValue: addr.sun_path) { exit(2) } // the rest stays zero, so the path ends
-withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: pathBytes) }
-let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
-if ok != 0 { exit(3) }
-// Only Obsidian (A4's chat) may hear John: the other end of the socket must be an Obsidian process,
-// and the socket must sit in this user's own temporary folder.
-func peerIsObsidian() -> Bool {
-  var pid: pid_t = 0; var len = socklen_t(MemoryLayout<pid_t>.size)
-  guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0, pid > 0 else { return false }
-  var buf = [CChar](repeating: 0, count: 4096)
-  guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
-  return String(cString: buf).hasPrefix("/Applications/Obsidian.app/Contents/")
+// --listen <seconds>: self-check of the whole listener, printing what it would send, with timings, then exits.
+let listenFor = arg("--listen").flatMap(Double.init)
+let started = Date()
+func connectToChat() -> Int32 {
+  guard let sockPath = arg("--socket") else { print("usage: --socket <path> | --file <audio> | --mic | --listen <seconds>"); exit(2) }
+  // The chat's socket.
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+  var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
+  let pathBytes = Array(sockPath.utf8)
+  if pathBytes.count >= MemoryLayout.size(ofValue: addr.sun_path) { exit(2) } // the rest stays zero, so the path ends
+  withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: pathBytes) }
+  let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+  if ok != 0 { exit(3) }
+  // Only Obsidian (A4's chat) may hear John: the other end of the socket must be an Obsidian process,
+  // and the socket must sit in this user's own temporary folder.
+  func peerIsObsidian() -> Bool {
+    var pid: pid_t = 0; var len = socklen_t(MemoryLayout<pid_t>.size)
+    guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0, pid > 0 else { return false }
+    var buf = [CChar](repeating: 0, count: 4096)
+    guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
+    return String(cString: buf).hasPrefix("/Applications/Obsidian.app/Contents/")
+  }
+  let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path
+  if !URL(fileURLWithPath: sockPath).resolvingSymlinksInPath().path.hasPrefix(tmp + "/") || !peerIsObsidian() { exit(4) }
+  return fd
 }
-let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path
-if !URL(fileURLWithPath: sockPath).resolvingSymlinksInPath().path.hasPrefix(tmp + "/") || !peerIsObsidian() { exit(4) }
+let fd: Int32 = listenFor == nil ? connectToChat() : 1
 let out = FileHandle(fileDescriptor: fd)
 let outQ = DispatchQueue(label: "out")
 func send(_ o: [String: String]) {
+  var o = o
+  if listenFor != nil { o["at"] = String(format: "%.1f", Date().timeIntervalSince(started)) }
   guard let d = try? JSONSerialization.data(withJSONObject: o) else { return }
   outQ.async { try? out.write(contentsOf: d + Data([10])) }
 }
+// Only in the --listen self-check: why a request ended.
+func note(_ s: String) { if listenFor != nil { send(["type": "note", "text": s]) } }
 
 final class Listener {
   // The mic is read through a capture session: an AVAudioEngine tap got no sound at all in this
@@ -150,15 +160,16 @@ final class Listener {
     let req = SFSpeechAudioBufferRecognitionRequest()
     req.requiresOnDeviceRecognition = true
     req.shouldReportPartialResults = true
-    self.req = req
+    self.req = req; note("request start")
     task = r.recognitionTask(with: req) { [weak self] res, err in
       DispatchQueue.main.async {
         guard let self, self.req === req else { return }
         if let res {
           let t = [self.said, res.bestTranscription.formattedString].filter { !$0.isEmpty }.joined(separator: " ")
           if t != self.text { self.text = t; send(["type": "partial", "text": t]); self.arm() }
-          if res.isFinal { self.carryOn() }
-        } else if err != nil { // a quiet stretch or the time limit ends the request: keep what was heard and listen on,
+          if res.isFinal { note("recognizer final"); self.carryOn() }
+        } else if let err { // a quiet stretch or the time limit ends the request: keep what was heard and listen on,
+          note("recognizer error: \(err.localizedDescription)")
           if !self.text.isEmpty { self.carryOn(after: 0.5) } else { self.restart(after: 0.5) } // the pause timer still sends it
         }
       }
@@ -208,7 +219,7 @@ authorize { err in
 }
 
 // Commands from the chat; the socket closing (Obsidian quit, End talk) ends the app.
-Thread {
+if let listenFor { DispatchQueue.main.asyncAfter(deadline: .now() + listenFor) { exit(0) } } else { Thread {
   var buf = Data()
   var chunk = [UInt8](repeating: 0, count: 4096)
   while true {
@@ -228,5 +239,5 @@ Thread {
       }
     }
   }
-}.start()
+}.start() }
 RunLoop.main.run()
