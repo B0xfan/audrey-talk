@@ -134,6 +134,11 @@ final class Listener {
     guard let r = recognizer() else { return send(["type": "error", "message": "This Mac has no on-device English speech recognition."]) }
     self.r = r
     do { try mic.start() } catch { return send(["type": "error", "message": "Could not start the microphone: \(error.localizedDescription)"]) }
+    // The session fails quietly otherwise (another app took the mic, or it went away).
+    NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: mic.session, queue: .main) { n in
+      let e = n.userInfo?[AVCaptureSessionErrorKey] as? Error
+      send(["type": "error", "message": "The microphone stopped: \(e?.localizedDescription ?? "unknown reason")"])
+    }
     begin()
     send(["type": "ready"])
   }
